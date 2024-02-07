@@ -1,0 +1,326 @@
+config {
+    type: "incremental",
+    bigquery: {
+        partitionBy: "DATE(session_start_time)",
+        updatePartitionFilter: "session_start_time >= timestamp_sub(current_timestamp(), interval 3 hour)"
+    },
+    uniqueKey: ["session_id", "position"],
+    assertions: {
+        uniqueKey: ["session_id", "position"],
+        nonNull: ["session_id", "position"]
+    },
+    description: "Main reporting table for DFCX conversations",
+}
+
+WITH
+  _self AS (
+  SELECT
+    incremental_run,
+    session_id,
+    MAX(position) AS last_loaded_position,
+    MIN(request_time) AS first_request_time
+  FROM
+    ${self()}
+  WHERE
+    request_time > TIMESTAMP_SUB(request_time_checkpoint, INTERVAL 1 DAY)
+  GROUP BY
+    1,
+    2 ),
+  base_data AS (
+  SELECT
+    dfcx.project_id AS project_id,
+    SPLIT(dfcx.conversation_name,'/')[SAFE_OFFSET(3)] AS location,
+    dfcx.agent_id AS agent_id,
+    ARRAY_REVERSE(SPLIT(dfcx.conversation_name,'/'))[SAFE_OFFSET(0)] AS session_id,
+    JSON_VALUE(dfcx.response,'$.responseId') AS response_id,
+    dfcx.request_time AS request_time,
+  IF
+    (incremental_run = TRUE, COALESCE(last_loaded_position,0) + ROW_NUMBER() OVER (PARTITION BY ARRAY_REVERSE(SPLIT(dfcx.conversation_name,'/'))[SAFE_OFFSET(0)]
+      ORDER BY
+        request_time ASC),ROW_NUMBER() OVER (PARTITION BY ARRAY_REVERSE(SPLIT(dfcx.conversation_name,'/'))[SAFE_OFFSET(0)]
+      ORDER BY
+        request_time ASC)) AS position,
+    JSON_VALUE(dfcx.request,'$.queryInput.text.text') AS user_utterance,
+    JSON_VALUE(dfcx.request,'$.queryInput.dtmf.digits') AS optional_dtmf_digits,
+    ARRAY_REVERSE(SPLIT(JSON_VALUE(dfcx.response,'$.queryResult.intent.name'),'/'))[SAFE_OFFSET(0)] AS intent_display_id,
+    JSON_VALUE(dfcx.response,'$.queryResult.intent.displayName') AS intent_display_name,
+    JSON_VALUE(dfcx.response,'$.queryResult.match.matchType') AS match_type,
+    JSON_VALUE(dfcx.response,'$.queryResult.match.confidence') AS intent_confidence_score,
+    TO_JSON(COALESCE(JSON_QUERY(dfcx.response,'$.queryResult.parameters'),JSON_OBJECT())) AS session_parameters,
+    JSON_QUERY_ARRAY(dfcx.response,'$.queryResult.diagnosticInfo.Execution Sequence') AS execution_sequence,
+    dfcx.language_code,
+    JSON_VALUE(dfcx.request,'$.queryInput.event.event') AS event,
+    JSON_QUERY_ARRAY(dfcx.response,'$.queryResult.responseMessages') AS response_messages,
+  IF
+    (JSON_VALUE(conversation_signals,'$.turnSignals.agentEscalated')='true',TRUE,FALSE) AS live_agent_handoff,
+    JSON_QUERY_ARRAY(dfcx.response,'$.queryResult.diagnosticInfo.Alternative Matched Intents') AS alternative_matched_intents
+  FROM
+    `${dataform.projectConfig.defaultDatabase}.${dataform.projectConfig.vars.dialogflowExport}` AS dfcx
+  LEFT JOIN
+    _self
+  ON
+    ARRAY_REVERSE(SPLIT(dfcx.conversation_name,'/'))[SAFE_OFFSET(0)] = _self.session_id
+  WHERE
+    TRUE
+    AND request_time > request_time_checkpoint QUALIFY ROW_NUMBER() OVER (PARTITION BY session_id, response_id ORDER BY request_time DESC) = 1 ),
+  execution_sequence AS (
+  SELECT
+    step + 1 AS step,
+    session_id,
+    position,
+    REGEXP_REPLACE(REGEXP_REPLACE(TO_JSON_STRING(execution_sequence),r'Step \d+','Step X'),r'SessionParameters\(Updated\)','SessionParameters') AS execution_sequence_step
+  FROM
+    base_data
+  LEFT JOIN
+    UNNEST(base_data.execution_sequence) AS execution_sequence
+  WITH
+  OFFSET
+    AS step
+  WHERE
+    1=1 ),
+  execution_sequence_parse AS (
+  SELECT
+    session_id,
+    position,
+    step,
+    JSON_VALUE(execution_sequence_step,'$.Step X.InitialState.FlowState.FlowId') AS flow_id_initial_state,
+    JSON_VALUE(execution_sequence_step,'$.Step X.InitialState.FlowState.Name') AS flow_display_name_initial_state,
+    JSON_VALUE(execution_sequence_step,'$.Step X.InitialState.FlowState.PageState.PageId') AS page_id_initial_state,
+    JSON_VALUE(execution_sequence_step,'$.Step X.InitialState.FlowState.PageState.Name') AS page_display_name_initial_state,
+    JSON_VALUE(execution_sequence_step,'$.Step X.InitialState.FlowState.PageState.Status') AS status_initial_state,
+    JSON_QUERY(execution_sequence_step,'$.Step X.InitialState.SessionParameters') AS session_parameters_initial,
+    JSON_VALUE(execution_sequence_step,'$.Step X.StateMachine.FlowState.FlowId') AS flow_id,
+    JSON_VALUE(execution_sequence_step,'$.Step X.StateMachine.FlowState.Name') AS flow_display_name,
+    JSON_VALUE(execution_sequence_step,'$.Step X.StateMachine.FlowState.PageState.PageId') AS page_id,
+    JSON_VALUE(execution_sequence_step,'$.Step X.StateMachine.FlowState.PageState.Name') AS page_display_name,
+    JSON_VALUE(execution_sequence_step,'$.Step X.StateMachine.FlowState.PageState.Status') AS status,
+    JSON_QUERY(execution_sequence_step,'$.Step X.FunctionExecution.SessionParameters') AS session_parameters_updated,
+    JSON_QUERY(execution_sequence_step,'$.Step X.FunctionExecution.SystemFunctionResults') AS system_function_results,
+    JSON_QUERY_ARRAY(execution_sequence_step,'$.Step X.FunctionExecution.Responses') AS responses,
+    JSON_VALUE(execution_sequence_step,'$.Step X.StateMachine.TriggeredTransitionRouteId') AS triggered_transition_route_id,
+    JSON_VALUE(execution_sequence_step,'$.Step X.StateMachine.TriggeredIntent') AS triggered_intent,
+    JSON_VALUE(execution_sequence_step,'$.Step X.StateMachine.TriggeredCondition') AS triggered_condition,
+    JSON_VALUE(execution_sequence_step,'$.Step X.StateMachine.TargetFlow') AS target_flow_id,
+    JSON_VALUE(execution_sequence_step,'$.Step X.StateMachine.TargetPage') AS target_page_id,
+    JSON_VALUE(execution_sequence_step,'$.Step X.FunctionExecution.Webhook.ID') AS webhook_id,
+    JSON_VALUE(execution_sequence_step,'$.Step X.FunctionExecution.Webhook.DisplayName') AS webhook_display_name,
+    JSON_VALUE(execution_sequence_step,'$.Step X.FunctionExecution.Webhook.Latency') AS webhook_latency,
+    CAST(REGEXP_EXTRACT(JSON_VALUE(execution_sequence_step,'$.Step X.FunctionExecution.Webhook.Latency'),r'(\d+)') AS INT64) AS webhook_latency_ms,
+    JSON_VALUE(execution_sequence_step,'$.Step X.FunctionExecution.Webhook.Status') AS webhook_status,
+    JSON_VALUE(execution_sequence_step,'$.Step X.FunctionExecution.Webhook.URL') AS webhook_url
+  FROM
+    execution_sequence AS es ),
+  execution_sequence_agg AS (
+  SELECT
+    session_id,
+    position,
+    MAX((
+      SELECT
+        MAX(
+        IF
+          (JSON_QUERY(response,'$.liveAgentHandoff') IS NOT NULL, TRUE, FALSE))
+      FROM
+        UNNEST(responses) AS response)) AS live_agent_escalation,
+    COUNT(*) AS execution_sequence_count,
+    ARRAY_AGG(STRUCT( step,
+        COALESCE(flow_id_initial_state,flow_id) AS flow_id,
+        COALESCE(flow_display_name_initial_state,flow_display_name) AS flow_display_name,
+        COALESCE(page_id_initial_state,page_id) AS page_id,
+        COALESCE(page_display_name_initial_state,page_display_name) AS page_display_name,
+        COALESCE(status_initial_state,status) AS status,
+        session_parameters_initial,
+        session_parameters_updated,
+        system_function_results,
+        responses,
+        triggered_transition_route_id,
+        triggered_intent,
+        triggered_condition,
+        target_flow_id,
+        target_page_id )
+    ORDER BY
+      step ASC) AS execution_sequence
+  FROM
+    execution_sequence_parse
+  GROUP BY
+    1,
+    2 ),
+  webhook_agg AS (
+  SELECT
+    session_id,
+    position,
+    ARRAY_AGG(STRUCT( step,
+        flow_id,
+        flow_display_name,
+        page_id,
+        page_display_name,
+        webhook_id,
+        webhook_display_name,
+        webhook_latency_ms,
+        webhook_status,
+        webhook_url,
+        session_parameters_updated )
+    ORDER BY
+      step ASC) AS webhooks
+  FROM
+    execution_sequence_parse
+  WHERE
+    webhook_id IS NOT NULL
+  GROUP BY
+    1,
+    2 ),
+  source_and_target_page AS (
+  SELECT
+    session_id,
+    position,
+    execution_sequence[SAFE_OFFSET(0)].flow_id AS source_flow_id,
+    execution_sequence[SAFE_OFFSET(0)].flow_display_name AS source_flow_display_name,
+    execution_sequence[SAFE_OFFSET(0)].page_id AS source_page_id,
+    execution_sequence[SAFE_OFFSET(0)].page_display_name AS source_page_display_name,
+    execution_sequence[SAFE_OFFSET(ARRAY_LENGTH(execution_sequence)-1)].flow_id,
+    execution_sequence[SAFE_OFFSET(ARRAY_LENGTH(execution_sequence)-1)].flow_display_name,
+    execution_sequence[SAFE_OFFSET(ARRAY_LENGTH(execution_sequence)-1)].page_id,
+    execution_sequence[SAFE_OFFSET(ARRAY_LENGTH(execution_sequence)-1)].page_display_name
+  FROM
+    execution_sequence_agg ),
+  session AS (
+  SELECT
+    base_data.session_id,
+  IF
+    (MIN(_self.first_request_time) < MIN(base_data.request_time),MIN(_self.first_request_time), MIN(base_data.request_time)) AS session_start_time,
+    MAX(base_data.request_time) AS session_end_time
+  FROM
+    base_data
+  LEFT JOIN
+    _self
+  ON
+    base_data.session_id = _self.session_id
+  GROUP BY
+    1 ),
+  agent_response AS (
+  SELECT
+    session_id,
+    position,
+    STRING_AGG(JSON_VALUE(response_text,'$'),' '
+    ORDER BY
+      session_id, position, response_offset,response_text_offset) AS agent_response
+  FROM (
+    SELECT
+      *
+    FROM
+      execution_sequence_parse
+    WHERE
+      ARRAY_LENGTH(responses) > 0 QUALIFY ROW_NUMBER() OVER (PARTITION BY session_id, position ORDER BY step DESC) = 1 ) AS a
+  INNER JOIN
+    UNNEST(a.responses) AS response
+  WITH
+  OFFSET
+    AS response_offset
+  INNER JOIN
+    UNNEST(JSON_QUERY_ARRAY(response,'$.text.text')) AS response_text
+  WITH
+  OFFSET
+    AS response_text_offset
+  GROUP BY
+    1,
+    2 ),
+  alternative_matched_intents AS (
+  SELECT
+    session_id,
+    position,
+    ARRAY_AGG( STRUCT( JSON_VALUE(alternative_matched_intent,'$.DisplayName') AS alternative_matched_intent,
+        SAFE_CAST(JSON_VALUE(alternative_matched_intent,'$.Score') AS NUMERIC) AS score )
+    ORDER BY
+      SAFE_CAST(JSON_VALUE(alternative_matched_intent,'$.Score') AS NUMERIC) DESC ) AS alternative_matched_intents
+  FROM
+    base_data,
+    UNNEST(alternative_matched_intents) AS alternative_matched_intent
+  WITH
+  OFFSET
+    AS alternative_matched_intents_offset
+  GROUP BY
+    1,
+    2 )
+SELECT
+  base_data.project_id,
+  base_data.location,
+  base_data.agent_id,
+  base_data.session_id,
+  session.session_start_time,
+  session.session_end_time,
+  base_data.response_id,
+  base_data.request_time,
+  base_data.position,
+  base_data.user_utterance,
+  base_data.optional_dtmf_digits,
+  agent_response.agent_response,
+  source_and_target_page.source_flow_id,
+  source_and_target_page.source_flow_display_name,
+  source_and_target_page.source_page_id,
+  source_and_target_page.source_page_display_name,
+  source_and_target_page.flow_id,
+  source_and_target_page.flow_display_name,
+  source_and_target_page.page_id,
+  source_and_target_page.page_display_name,
+  base_data.intent_display_id,
+  base_data.intent_display_name,
+  base_data.intent_confidence_score,
+  base_data.match_type,
+  base_data.event,
+  base_data.live_agent_handoff,
+  execution_sequence_agg.live_agent_escalation,
+  execution_sequence_agg.execution_sequence_count,
+  base_data.language_code,
+  base_data.session_parameters,
+  execution_sequence_agg.execution_sequence,
+  webhook_agg.webhooks,
+  alternative_matched_intents.alternative_matched_intents
+FROM
+  base_data
+LEFT JOIN
+  execution_sequence_agg
+USING
+  (session_id,
+    position)
+LEFT JOIN
+  webhook_agg
+USING
+  (session_id,
+    position)
+LEFT JOIN
+  source_and_target_page
+USING
+  (session_id,
+    position)
+LEFT JOIN
+  session
+USING
+  (session_id)
+LEFT JOIN
+  agent_response
+USING
+  (session_id,
+    position)
+LEFT JOIN
+  alternative_matched_intents
+USING
+  (session_id,
+    position)
+
+pre_operations {
+  DECLARE
+    request_time_checkpoint DEFAULT (
+    ${
+        when(incremental(),
+            `select max(request_time) from ${self()}`,
+            `select timestamp("2000-01-01")`)
+    }
+    );
+  DECLARE
+    incremental_run DEFAULT (
+    ${
+        when(incremental(),
+            'TRUE',
+            'FALSE')
+    }
+    );
+}

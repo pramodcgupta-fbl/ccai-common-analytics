@@ -1,0 +1,10 @@
+{
+  "defaultSchema": "ccai_fbl_bq_export",
+  "assertionSchema": "dataform_assertions",
+  "warehouse": "bigquery",
+  "defaultDatabase": "ccai-common-analytics",
+  "defaultLocation": "US",
+  "vars": {
+    "dialogflowExport":"ccai_fbl_bq_export.conversation_logs"
+  }
+}
