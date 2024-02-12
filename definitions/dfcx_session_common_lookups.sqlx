@@ -35,9 +35,9 @@ WITH
     conversation.session_id,
     -- conversation_info.att_call_id,
     -- conversation_info.final_interaction_head_intent,
-    is_call_recorded,
+    -- is_call_recorded,
     CONCAT( 'https://dialogflow.cloud.google.com/cobweb/logs/', conversation.session_id, '?name=projects%2F', conversation.project_id, '%2Flocations%2F', conversation.location, '%2Fagents%2F', conversation.agent_id ) AS cobweb_url,
-    CONCAT( 'https://pantheon.corp.google.com/logs/query;', 'query=resource.type%3D%22global%22%0Aresource.labels.project_id%3D%22', conversation.project_id, '%22%0Alabels.session_id%3D%22', conversation.session_id, '%22;', 'timeRange=', FORMAT_DATETIME( '%Y-%m-%dT%H:%M:%S.000Z', DATETIME(conversation_info.session_start_time, 'UTC')), '%2F', FORMAT_DATETIME( '%Y-%m-%dT%H:%M:%S.000Z', DATETIME(conversation_info.session_start_time, 'UTC')), '--PT15M;', '?', 'project=', conversation.project_id) AS logs_explorer_url,
+    CONCAT( 'https://pantheon.corp.google.com/logs/query;', 'query=resource.type%3D%22global%22%0Aresource.labels.project_id%3D%22', conversation.project_id, '%22%0Alabels.session_id%3D%22', conversation.session_id, '%22;', 'timeRange=', FORMAT_DATETIME( '%Y-%m-%dT%H:%M:%S.000Z', DATETIME(conversation.session_start_time, 'UTC')), '%2F', FORMAT_DATETIME( '%Y-%m-%dT%H:%M:%S.000Z', DATETIME(conversation.session_start_time, 'UTC')), '--PT15M;', '?', 'project=', conversation.project_id) AS logs_explorer_url,
     CONCAT( 'https://dialogflow.cloud.google.com/cx/projects/',conversation.project_id,'/locations/',conversation.location,'/agents/',agent_id,'/conversations/',conversation.session_id) AS dfcx_url,
     CONCAT( 'https://lookerstudio.google.com/c/u/{{AUTH_USER}}/reporting/543e2147-9bf4-41e6-b527-a66f86df5d40/page/9n0eD?params=','%7B%22ds0.AUTH_USER%22%3A%22{{AUTH_USER}}%22%2C%22ds0.SESSION_DATE%22%3A%22',FORMAT_TIMESTAMP('%Y-%m-%d', conversation.session_start_time),'%22%2C%22ds0.SESSION_ID%22%3A%22',conversation.session_id,'%22%7D') AS transcript_explorer_url
   FROM
@@ -56,10 +56,7 @@ WITH
     5,
     6,
     7,
-    8,
-    9,
-    10,
-    11 )
+    8 )
 SELECT
   *
 FROM
